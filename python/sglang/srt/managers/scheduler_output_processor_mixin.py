@@ -260,7 +260,43 @@ class SchedulerOutputProcessorMixin:
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> List[List[int]]:
-        """Resolve the padding next token ids for speculative decoding with overlap."""
+        """
+        Extract per-request accepted tokens from PADDED tensor using stride-based indexing.
+
+        =======================================================================
+        TREE-AS-CHAIN: Unified stride-based extraction for both modes
+        =======================================================================
+
+        After worker's TREE-AS-CHAIN unification, both tree and chain mode
+        return PADDED tensors [bs * stride] where each request's valid tokens
+        are at positions [i * stride : i * stride + accept_lens[i]].
+
+        PADDED LAYOUT (same for both tree and chain):
+          [tok0, tok1, tok2, G, G, ..., tok32, tok33, G, G, ...]
+           |----req0-----|              |----req1----|
+           valid prefix   garbage       valid prefix  garbage
+
+        EXTRACTION (stride-based, same for both):
+          stride = speculative_num_draft_tokens
+          req0: tokens[0*stride : 0*stride+3] = [tok0, tok1, tok2] ✓
+          req1: tokens[1*stride : 1*stride+2] = [tok32, tok33] ✓
+
+        =======================================================================
+        EXAMPLE: stride=32, bs=2, accept_lens=[3, 2]
+        =======================================================================
+        PADDED next_token_ids: [tok0, tok1, tok2, G, ..., tok32, tok33, G, ...]
+
+        Extraction:
+          req0: tokens[0:3] = [tok0, tok1, tok2]
+          req1: tokens[32:34] = [tok32, tok33]
+
+        kv_committed_len update:
+          req0: 100 → 103 (+3)
+          req1: 200 → 202 (+2)
+        =======================================================================
+
+        [NO CPU-GPU SYNC] All tensors are already on CPU (worker sends CPU tensors)
+        """
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
 

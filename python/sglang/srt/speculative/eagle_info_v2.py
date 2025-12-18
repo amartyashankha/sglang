@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -79,7 +80,55 @@ def assign_draft_cache_locs_page_size_1(
 
 @dataclass
 class EagleDraftInputV2Mixin:
+    """
+    Mixin for EagleDraftInput that provides V2 (overlap mode) preparation methods.
+
+    ═══════════════════════════════════════════════════════════════════════════
+    OVERVIEW
+    ═══════════════════════════════════════════════════════════════════════════
+    This mixin adds methods used during the speculative decoding iteration:
+
+    1. prepare_for_decode() - Scheduler calls before sending to worker
+       └─► Over-allocates KV slots, writes to req_to_token
+
+    2. prepare_for_v2_draft() - Called by EagleDraftWorker.draft()
+       └─► Sets up batch for draft model forward
+
+    3. prepare_for_extend_to_fill_draft_kvcache() - UNIFIED draft extend (both modes)
+       └─► Uniform extend by tree_size for all requests
+       └─► With Tree-as-Chain, tree mode uses this too (after compaction)
+    ═══════════════════════════════════════════════════════════════════════════
+    """
+
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
+        """
+        Prepare batch for decode iteration: over-allocate KV slots.
+
+        ═══════════════════════════════════════════════════════════════════════
+        FLOW
+        ═══════════════════════════════════════════════════════════════════════
+        Called by: Scheduler.prepare_for_decode() before get_model_worker_batch()
+        Next step: Batch sent to EAGLEWorkerV2.forward_batch_generation()
+
+        ═══════════════════════════════════════════════════════════════════════
+        PURPOSE
+        ═══════════════════════════════════════════════════════════════════════
+        V2 uses over-allocation to avoid per-iteration slot allocation calls.
+        This function allocates 2 * ALLOC_LEN_PER_DECODE slots ahead of time:
+          - First tree_size: for current verification
+          - Second tree_size: pre-allocated for next iteration
+
+        The slots are written to req_to_token mapping so the worker can read
+        them via prepare_for_v2_draft() and prepare_for_v2_verify().
+
+        ═══════════════════════════════════════════════════════════════════════
+        KEY FORMULA
+        ═══════════════════════════════════════════════════════════════════════
+        needed = kv_committed + 2 * ALLOC_LEN - kv_allocated
+        kv_allocated += needed
+
+        This ensures kv_allocated is always 2 * ALLOC_LEN ahead of kv_committed.
+        """
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
         bs = batch.batch_size()
@@ -144,6 +193,24 @@ class EagleDraftInputV2Mixin:
         topk: int,
         num_steps: int,
     ):
+        """
+        Prepare batch for draft model forward.
+
+        ═══════════════════════════════════════════════════════════════════════
+        FLOW
+        ═══════════════════════════════════════════════════════════════════════
+        Called by: EagleDraftWorker.draft()
+        Next step: draft_forward() or cuda_graph_runner.replay()
+
+        ═══════════════════════════════════════════════════════════════════════
+        PURPOSE
+        ═══════════════════════════════════════════════════════════════════════
+        Sets up out_cache_loc for draft model by reading from req_to_token.
+        The draft model will write KV to these slots during draft_forward().
+
+        Reads: req_to_token[req, seq_lens : seq_lens + topk * num_steps]
+        This region was pre-allocated by prepare_for_decode().
+        """
         if not batch.forward_mode.is_idle():
             bs = len(batch.seq_lens)
 
@@ -181,6 +248,27 @@ class EagleDraftInputV2Mixin:
         draft_model_runner: Any,
         cuda_graph_runner: Any,
     ):
+        """
+        Prepare draft extend with UNIFORM num_draft_tokens (UNIFIED for both modes).
+
+        ═══════════════════════════════════════════════════════════════════════
+        FLOW
+        ═══════════════════════════════════════════════════════════════════════
+        Called by: EagleDraftWorker._draft_extend_for_decode() (BOTH tree & chain)
+        Next step: draft_runner.forward() writes KV to draft cache
+
+        ═══════════════════════════════════════════════════════════════════════
+        TREE-AS-CHAIN UNIFICATION
+        ═══════════════════════════════════════════════════════════════════════
+        After verify() compaction, BOTH tree and chain modes have:
+          - PADDED predict tensor [bs * tree_size] with valid prefix per request
+          - Compacted out_cache_loc and req_to_token
+
+        This allows unified "blind extend" by tree_size for all requests.
+        Garbage KV is written but scheduler rewinds seq_lens to correct values.
+
+        Uses PADDED predict tensor - prefix is valid for both modes after compaction.
+        """
         seq_lens_cpu_ = batch.seq_lens_cpu
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
@@ -207,6 +295,20 @@ class EagleDraftInputV2Mixin:
 
 @dataclass
 class EagleVerifyInputV2Mixin:
+    """
+    Mixin for EagleVerifyInput that provides V2 verification methods.
+
+    ═══════════════════════════════════════════════════════════════════════════
+    OVERVIEW
+    ═══════════════════════════════════════════════════════════════════════════
+    1. prepare_for_v2_verify() - Called by EAGLEWorkerV2.verify()
+       └─► Sets up batch for target model verification
+
+    2. sample() - Called by EAGLEWorkerV2.verify() after target forward
+       └─► Tree greedy sampling, returns SPARSE predict + accept_index
+    ═══════════════════════════════════════════════════════════════════════════
+    """
+
     def prepare_for_v2_verify(
         self: EagleVerifyInput,
         req_to_token_pool: ReqToTokenPool,
@@ -368,6 +470,12 @@ class EagleVerifyInputV2Mixin:
 
         # Include the bonus token
         accept_length.add_(1)
+
+        # DEBUG: Concise logging (only for bs>1)
+        if os.environ.get("EAGLE3_DEBUG") and bs > 1:
+            valid_counts = [(accept_index[i] != -1).sum().item() for i in range(bs)]
+            print(f"\n[EAGLE3_DEBUG sample] bs={bs}, accept_lens={accept_length.tolist()}, valid_counts={valid_counts}")
+
         return predict, accept_length, accept_index
 
 
@@ -457,6 +565,62 @@ def fill_accepted_out_cache_loc(
 
 
 @triton.jit
+def compact_data_tensors_kernel(
+    accept_index,
+    accept_length,
+    predict,
+    hidden_states,
+    out_cache_loc,
+    out_predict,
+    out_hidden,
+    out_cache,
+    stride: tl.constexpr,
+    max_accept: tl.constexpr,
+    hidden_dim: tl.constexpr,
+):
+    """Compact predict, hidden_states, and out_cache_loc into fixed-stride buffers.
+
+    IMPORTANT: accept_length includes the bonus token (+1), but accept_index only
+    contains indices for matched draft tokens. We must check src_idx >= 0 to avoid
+    reading from -1 padding.
+    """
+    BLOCK_H: tl.constexpr = 128
+    pid = tl.program_id(axis=0)
+    acc_len = tl.load(accept_length + pid)
+
+    accept_row = accept_index + pid * max_accept
+    out_base = pid * stride
+
+    for col in tl.static_range(max_accept):
+        if col < acc_len:
+            src_idx = tl.load(accept_row + col)
+            # CRITICAL: accept_index may have -1 padding if accept_length includes
+            # the bonus token but accept_index doesn't have an entry for it.
+            # Skip invalid indices to avoid OOB access.
+            if src_idx >= 0:
+                dst_idx = out_base + col
+
+                tok = tl.load(predict + src_idx)
+                tl.store(out_predict + dst_idx, tok)
+
+                cache_loc = tl.load(out_cache_loc + src_idx)
+                tl.store(out_cache + dst_idx, cache_loc)
+
+                # Blocked copy over hidden dimension
+                for h_start in tl.static_range(0, hidden_dim, BLOCK_H):
+                    h_offsets = h_start + tl.arange(0, BLOCK_H)
+                    h_mask = h_offsets < hidden_dim
+                    h_vals = tl.load(
+                        hidden_states + src_idx * hidden_dim + h_offsets, mask=h_mask
+                    )
+                    tl.store(
+                        out_hidden + dst_idx * hidden_dim + h_offsets,
+                        h_vals,
+                        mask=h_mask,
+                    )
+
+
+@triton.jit
 def assign_extend_cache_locs(
     req_pool_indices,
     req_to_token,
@@ -536,3 +700,74 @@ def assign_extend_cache_locs_func(
         out_cache_loc = out_cache_loc.to(dtype=torch.int64)
 
         return out_cache_loc
+
+
+def compact_data_tensors_func(
+    accept_index: torch.Tensor,
+    accept_length: torch.Tensor,
+    tree_size: int,
+    predict: torch.Tensor,
+    hidden_states: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+):
+    """
+    Compact scattered acceptance into prefix form for data tensors (CUDA/HIP).
+
+    Uses a fused Triton kernel to compact predict, hidden_states, and out_cache_loc
+    in a single pass. This replaces 3 separate gather operations.
+
+    NOTE: req_to_token compaction is handled separately by the caller using
+    _compact_req_to_token_with_perm() because in-place array reordering with
+    dynamic indexing is not efficiently expressible in Triton.
+
+    Args:
+        accept_index: [bs, max_accept] - flat indices into [bs*tree_size], -1 padded
+        accept_length: [bs] - count of valid entries per request
+        tree_size: number of draft tokens per request
+        predict: [bs * tree_size] - sparse token predictions
+        hidden_states: [bs * tree_size, H] - sparse hidden states
+        out_cache_loc: [bs * tree_size] - sparse KV cache locations
+
+    Returns:
+        packed_predict: [bs * tree_size] - compacted, prefix valid per request
+        packed_hidden: [bs * tree_size, H] - compacted hidden states
+        packed_cache: [bs * tree_size] - compacted cache locations
+    """
+    if not (_is_cuda or _is_hip):
+        raise RuntimeError("compact_data_tensors_func requires CUDA or HIP backend")
+
+    bs = accept_index.shape[0]
+    max_accept = accept_index.shape[1]
+    stride = tree_size
+    hidden_dim = hidden_states.shape[-1]
+
+    assert stride >= max_accept, "tree_size must be >= max accepted tokens"
+
+    # Use zeros (not empty!) to avoid garbage in unwritten suffix positions
+    packed_predict = torch.zeros(
+        (bs * stride,), device=predict.device, dtype=predict.dtype
+    )
+    packed_hidden = torch.zeros(
+        (bs * stride, hidden_dim),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    packed_cache = torch.zeros(
+        (bs * stride,), device=out_cache_loc.device, dtype=out_cache_loc.dtype
+    )
+
+    compact_data_tensors_kernel[(bs,)](
+        accept_index,
+        accept_length,
+        predict,
+        hidden_states,
+        out_cache_loc,
+        packed_predict,
+        packed_hidden,
+        packed_cache,
+        stride=stride,
+        max_accept=max_accept,
+        hidden_dim=hidden_dim,
+    )
+
+    return packed_predict, packed_hidden, packed_cache

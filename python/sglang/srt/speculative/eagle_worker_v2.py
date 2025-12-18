@@ -33,6 +33,7 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
+    compact_data_tensors_func,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
     select_top_k_tokens_tmp,
@@ -72,6 +73,33 @@ def _get_plan_stream(
 
 
 class EagleDraftWorker(BaseDraftWorker):
+    """
+    Draft model worker for EAGLE3 speculative decoding.
+
+    ═══════════════════════════════════════════════════════════════════════════
+    FLOW OVERVIEW
+    ═══════════════════════════════════════════════════════════════════════════
+    This worker handles the draft model operations in the speculative decoding
+    pipeline. The main entry points are:
+
+    1. draft() - Called by EAGLEWorkerV2.forward_batch_generation()
+       └─► Produces a tree of draft tokens for verification
+
+    2. _draft_extend_for_decode() - Called after verify() completes
+       └─► Fills draft KV cache with accepted tokens for next iteration
+
+    3. _draft_extend_for_prefill() - Called during prefill phase
+       └─► Initializes draft KV cache
+
+    TREE MODE vs CHAIN MODE:
+    - Chain mode (topk=1): Single path, accepted positions are contiguous
+    - Tree mode (topk>1): Multiple paths, accepted positions are scattered
+
+    Tree mode requires special handling in _draft_extend_for_decode() to
+    use dense repacked tensors and variable-length extend.
+    ═══════════════════════════════════════════════════════════════════════════
+    """
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -267,6 +295,43 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
+        """
+        Build a tree of draft tokens for target model verification.
+
+        ═══════════════════════════════════════════════════════════════════════
+        FLOW
+        ═══════════════════════════════════════════════════════════════════════
+        Called by: EAGLEWorkerV2.forward_batch_generation() (decode mode)
+        Next step: Returns EagleVerifyInput → used by EAGLEWorkerV2.verify()
+
+        ═══════════════════════════════════════════════════════════════════════
+        PROCESS
+        ═══════════════════════════════════════════════════════════════════════
+        1. prepare_for_v2_draft() - Set up batch, read out_cache_loc from req_to_token
+        2. draft_forward() - Run multiple steps of draft model
+           └─► Each step: generate topk tokens, write KV to out_cache_loc
+        3. build_tree_kernel_efficient() - Build tree mask for verification
+
+        ═══════════════════════════════════════════════════════════════════════
+        KEY TENSORS
+        ═══════════════════════════════════════════════════════════════════════
+        Input:
+          - model_worker_batch.seq_lens: [bs] current sequence lengths
+          - draft_input.verified_id: [bs] last verified token per request
+          - draft_input.hidden_states: [bs, hidden_dim] hidden states from prev iter
+
+        Output (EagleVerifyInput):
+          - draft_token: [bs, tree_size-1] draft tokens for verification
+          - custom_mask: Tree attention mask
+          - positions: Token positions in the tree
+          - retrive_index/next_token/next_sibling: Tree traversal indices
+
+        Args:
+            model_worker_batch: Batch containing spec_info (EagleDraftInput)
+
+        Returns:
+            EagleVerifyInput containing draft tokens and tree structure
+        """
         draft_input: EagleDraftInput = model_worker_batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
@@ -478,25 +543,111 @@ class EagleDraftWorker(BaseDraftWorker):
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
-        # Batch 2: Draft extend
+        """
+        Fill draft model's KV cache with accepted tokens after verification.
+
+        ═══════════════════════════════════════════════════════════════════════
+        FLOW
+        ═══════════════════════════════════════════════════════════════════════
+        Called by: EAGLEWorkerV2.forward_batch_generation() after verify()
+        Next step: Returns updated next_draft_input → used in next iteration's draft()
+
+        ═══════════════════════════════════════════════════════════════════════
+        PURPOSE
+        ═══════════════════════════════════════════════════════════════════════
+        The target model verified the draft tree and accepted some tokens.
+        Now we need to update the draft model's KV cache so it can generate
+        the next tree of draft tokens. This function:
+
+        1. Takes accepted token IDs and hidden states from verification
+        2. Runs draft model forward to write KV at accepted positions
+        3. Updates spec_info (topk_p, topk_index, hidden_states) for next draft()
+
+        ═══════════════════════════════════════════════════════════════════════
+        TREE-AS-CHAIN UNIFICATION
+        ═══════════════════════════════════════════════════════════════════════
+        After verify() compaction, BOTH tree and chain modes have identical
+        tensor layouts (PADDED [bs * tree_size]) and use the same code path:
+
+          - next_token_ids: PADDED [bs * tree_size], prefix valid per request
+          - logits_output.hidden_states: PADDED [bs * tree_size, H]
+          - batch.out_cache_loc: PADDED [bs * tree_size] (compacted for tree)
+          - Uniform extend by tree_size ("blind extend")
+          - Unified select_index: i * stride + accept_lens[i] - 1
+
+        ═══════════════════════════════════════════════════════════════════════
+        KEY TENSORS
+        ═══════════════════════════════════════════════════════════════════════
+        Input (from batch_result):
+          - next_token_ids: PADDED [bs * tree_size] with valid prefix
+          - accept_lens: [bs] number of accepted tokens per request
+          - logits_output.hidden_states: PADDED [bs * tree_size, H]
+
+        select_index: [bs] - Index of LAST accepted token per request
+          Computed on GPU: i * stride + accept_lens[i] - 1
+
+        Args:
+            batch: Current ModelWorkerBatch
+            batch_result: Result from verify() containing accepted tokens
+
+        Side effects:
+            - Updates batch.seq_lens by tree_size (uniform "blind extend")
+            - Writes KV to draft model's cache (including garbage suffix)
+            - Scheduler rewinds seq_lens to correct values later
+            - Updates batch_result.next_draft_input with topk_p, topk_index, hidden_states
+        """
+        bs = len(batch.seq_lens)
+        stride = self.speculative_num_draft_tokens
+
+        # =================================================================
+        # UNIFIED DRAFT EXTEND: Same path for tree and chain mode
+        # =================================================================
+        # TREE-AS-CHAIN: After verify() compaction, both modes have:
+        #   - next_token_ids: PADDED [bs * tree_size], prefix valid per request
+        #   - logits_output.hidden_states: PADDED [bs * tree_size, H]
+        #   - batch.out_cache_loc: PADDED [bs * tree_size] (compacted for tree)
+        #
+        # UNIFIED select_index formula (works for both):
+        #   select_index[i] = i * stride + accept_lens[i] - 1
+        #
+        # EXAMPLE: bs=2, stride=32, accept_lens=[3, 2]
+        # ─────────────────────────────────────────────────────────────────
+        # PADDED: [tok0, tok1, tok2, G, G, ..., tok32, tok33, G, ...]
+        #   req0: valid at [0:3], last at position 2 = 0*32 + 3 - 1
+        #   req1: valid at [32:34], last at position 33 = 1*32 + 2 - 1
+        #
+        # select_index = [2, 33]  (entirely on GPU, no CPU sync!)
+        # ─────────────────────────────────────────────────────────────────
+
+        # Unified select_index (GPU computation, no sync)
+        select_index = (
+            torch.arange(bs, device=self.device) * stride
+            + batch_result.accept_lens
+            - 1
+        )
+
+        # Use compacted hidden_states from verify() (same for both modes)
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
             num_tokens_per_batch=self.speculative_num_steps + 1,
             num_tokens_for_logprob_per_batch=1,
         )
-        select_index = (
-            torch.arange(len(batch.seq_lens), device=self.device)
-            * self.speculative_num_draft_tokens
-            + batch_result.accept_lens
-            - 1
-        )
 
-        # Prepare for draft extend in a separate stream
+        # CRITICAL STREAM SYNC: plan_stream must wait for verify() compaction!
+        # verify() runs compaction (req_to_token, out_cache_loc) in main stream.
+        # prepare_for_extend... reads req_to_token in plan_stream.
+        # Without this wait, plan_stream reads STALE/CORRUPTED req_to_token!
+        if self.plan_stream:
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
+
         with self.plan_stream_ctx:
+            # Unified: uniform extension by stride (no variable-length path)
             forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
                 batch,
-                batch_result.next_token_ids,
-                self.speculative_num_draft_tokens,
+                batch_result.next_token_ids,  # PADDED [bs * stride]
+                stride,
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
             )
@@ -602,6 +753,38 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pass
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
+        """
+        Main entry point for EAGLE3 speculative decoding with V2 overlap.
+
+        ═══════════════════════════════════════════════════════════════════════
+        FLOW
+        ═══════════════════════════════════════════════════════════════════════
+        Called by: TpWorker.forward_batch_generation() (via spec worker dispatch)
+        Next step: Returns to scheduler → _resolve_spec_overlap_token_ids()
+
+        ═══════════════════════════════════════════════════════════════════════
+        PREFILL MODE (is_extend)
+        ═══════════════════════════════════════════════════════════════════════
+        1. target_worker.forward_batch_generation() - Process prefill
+        2. draft_worker._draft_extend_for_prefill() - Initialize draft KV cache
+
+        ═══════════════════════════════════════════════════════════════════════
+        DECODE MODE
+        ═══════════════════════════════════════════════════════════════════════
+        1. draft_worker.draft()              - Generate draft tree
+        2. self.verify()                     - Target verifies (MODIFIED for tree)
+        3. draft_worker._draft_extend_for_decode() - Update draft KV (MODIFIED for tree)
+
+        The verify() step is where tree mode fixes are applied:
+          - Dense repack of predict, hidden_states, out_cache_loc
+          - Compaction of req_to_token verify window
+
+        Args:
+            model_worker_batch: Batch prepared by scheduler
+
+        Returns:
+            GenerationBatchResult with accepted tokens and updated draft input
+        """
         if (
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
@@ -646,6 +829,64 @@ class EAGLEWorkerV2(BaseSpecWorker):
             return batch_output
 
     def verify(self, batch: ModelWorkerBatch):
+        """
+        Run target model verification and handle tree mode post-processing.
+
+        ═══════════════════════════════════════════════════════════════════════
+        FLOW
+        ═══════════════════════════════════════════════════════════════════════
+        Called by: EAGLEWorkerV2.forward_batch_generation() (decode mode)
+        Next step: Returns → _draft_extend_for_decode() → scheduler
+
+        ═══════════════════════════════════════════════════════════════════════
+        PROCESS
+        ═══════════════════════════════════════════════════════════════════════
+        1. prepare_for_v2_verify() - Set up batch with tree mask
+        2. target_worker.forward_batch_generation() - Run target model
+        3. verify_input.sample() - Tree greedy sampling
+           └─► Returns: predict (SPARSE!), accept_index, accept_length
+
+        ═══════════════════════════════════════════════════════════════════════
+        TREE-AS-CHAIN: PADDED TENSOR COMPACTION (topk > 1)
+        ═══════════════════════════════════════════════════════════════════════
+        After sampling, tree mode compacts to PADDED [bs * tree_size] tensors:
+
+        1. STRIDED COMPACTION (SYNC-FREE)
+          - Build per_req_perm via _build_compaction_perm()
+          - Gather predict, hidden_states, out_cache_loc with strided perm
+          - Each request's valid tokens are now at prefix positions
+
+        2. req_to_token COMPACTION (MANDATORY)
+          - Reorder verify window so accepted slots form prefix
+          - Prevents KV corruption in next iteration
+
+        After compaction, tree mode tensors look like chain mode!
+
+        ═══════════════════════════════════════════════════════════════════════
+        KEY TENSORS
+        ═══════════════════════════════════════════════════════════════════════
+        From sample():
+          predict: SPARSE [bs * tree_size] - only accept_index positions have tokens
+          accept_index: [bs, num_steps+1] - FLAT indices or -1 for padding
+          accept_length: [bs] - count of accepted tokens (includes bonus)
+
+        After compaction (UNIFIED for both modes):
+          padded_predict: [bs * tree_size] - valid prefix per request, garbage suffix
+          hidden_states: [bs * tree_size, H] - valid prefix per request
+          out_cache_loc: [bs * tree_size] - compacted KV slots
+
+        Returns:
+          GenerationBatchResult with:
+            - next_token_ids: PADDED [bs * tree_size], prefix valid
+            - accept_lens: [bs]
+            - logits_output.hidden_states: PADDED (for _draft_extend_for_decode)
+
+        Args:
+            batch: ModelWorkerBatch with spec_info (EagleVerifyInput)
+
+        Returns:
+            GenerationBatchResult with accepted tokens and draft model inputs
+        """
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
@@ -657,6 +898,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_input: EagleVerifyInput = batch.spec_info
         verify_input.num_tokens_per_batch = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
+
+        # CRITICAL STREAM SYNC: plan_stream must wait for previous iteration's main_stream!
+        # prepare_for_v2_verify() runs in plan_stream and reads req_to_token.
+        # The previous iteration's _draft_extend_for_decode() modified req_to_token via
+        # draft model forward (which allocated new KV slots in main_stream).
+        # Without this sync, plan_stream races against prev iteration's main_stream.
+        if self.plan_stream:
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
@@ -737,31 +988,205 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_done.record()
 
         if not batch.forward_mode.is_idle():
-            all_verified_id = predict[accept_index]
+            # CRITICAL FIX: accept_index contains -1 padding. Direct indexing predict[accept_index]
+            # causes OOB access. We clamp -1 to 0 to safely gather (garbage at padding is ignored later).
+            all_verified_id = predict[accept_index.long().clamp(min=0)]
+
             verified_id = torch.empty_like(accept_length, dtype=torch.int32)
             fill_new_verified_id[(bs,)](
                 all_verified_id,
                 accept_length,
                 verified_id,
-                self.speculative_num_draft_tokens,
+                self.speculative_num_steps + 1,
             )
-        else:
-            verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
 
-        # Construct the next draft input
+            # =================================================================
+            # TREE-AS-CHAIN: Unified padded tensor approach (ZERO BLOCKING SYNCS)
+            # =================================================================
+            # PHILOSOPHY: Make tree mode behave like chain mode by using
+            # fixed-size padded tensors [bs * tree_size] instead of
+            # variable-size dense tensors [sum(accept_lens)].
+            #
+            # KEY INSIGHT: No CPU sync needed!
+            # ─────────────────────────────────────────────────────────────────
+            # - Chain: Accepted positions are contiguous [0,1,2,...], prefix valid
+            # - Tree: Accepted positions are scattered [0,3,15,...], needs compaction
+            # - Both: Return PADDED [bs * tree_size] tensors, valid prefix, garbage suffix
+            # - Scheduler uses stride-based extraction (same for both)
+            # - Draft extend uses uniform tree_size (same for both)
+            # ─────────────────────────────────────────────────────────────────
+            #
+            # EXAMPLE: steps=5, topk=10, tree_size=32, bs=2, accept_lens=[3, 2]
+            # ─────────────────────────────────────────────────────────────────
+            # PADDED predict: [64] with valid at prefix [0:3] and [32:34]
+            # Scheduler extracts: req0=[0:3], req1=[32:34] using stride=32
+            # ─────────────────────────────────────────────────────────────────
+
+            tree_size = self.speculative_num_draft_tokens
+            is_tree_mode = self.topk > 1
+
+            if is_tree_mode:
+                # =============================================================
+                # TREE MODE: Compact scattered acceptance to prefix
+                # =============================================================
+                # Hybrid approach:
+                #   - Data tensors (predict, hidden, cache): Fused Triton kernel
+                #   - req_to_token: argsort-based permutation (PyTorch)
+
+                # Fused kernel for data tensors
+                (
+                    padded_predict,
+                    packed_hidden,
+                    packed_cache,
+                ) = compact_data_tensors_func(
+                    accept_index,
+                    accept_length,
+                    tree_size,
+                    predict,
+                    logits_output.hidden_states,
+                    batch.out_cache_loc,
+                )
+
+                logits_output.hidden_states = packed_hidden
+                batch.out_cache_loc = packed_cache
+                output_predict = padded_predict
+
+                # req_to_token compaction via argsort (robust, small data)
+                per_req_perm = self._build_compaction_perm(
+                    accept_index, accept_length, tree_size
+                )
+                self._compact_req_to_token_with_perm(batch, per_req_perm, tree_size)
+            else:
+                # =============================================================
+                # CHAIN MODE: No compaction needed (accepted positions are prefix)
+                # =============================================================
+                output_predict = predict
+                # logits_output.hidden_states and batch.out_cache_loc already valid
+
+        else:
+            # Idle mode
+            verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
+            output_predict = predict
+
+        # Construct next draft input (unified for both modes)
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
+            hidden_states=None,  # Use logits_output.hidden_states in draft_extend
         )
 
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=predict,
+            next_token_ids=output_predict,  # PADDED [bs * tree_size]
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
         )
+
+    def _build_compaction_perm(
+        self,
+        accept_index: torch.Tensor,
+        accept_length: torch.Tensor,
+        tree_size: int,
+    ) -> torch.Tensor:
+        """
+        Build per-request permutation to compact req_to_token window (sync-free).
+
+        ═══════════════════════════════════════════════════════════════════════
+        ALGORITHM: Priority-Based Sorting
+        ═══════════════════════════════════════════════════════════════════════
+        1. Create priority tensor [bs, tree_size] initialized to 0 (rejected)
+        2. For each valid entry in accept_index:
+           - Scatter priority = BASE - seq_id to its position
+           - seq_id ensures sequence order (first accepted = highest priority)
+        3. argsort PER ROW to get local permutation
+
+        ═══════════════════════════════════════════════════════════════════════
+        EXAMPLE: bs=2, tree_size=32, accept_lens=[3, 2]
+        ═══════════════════════════════════════════════════════════════════════
+        accept_index = [[0, 3, 15, -1, -1, -1], [32, 34, -1, -1, -1, -1]]
+
+        per_req_perm (per-row argsort):
+          Row 0: [0, 3, 15, 1, 2, 4, 5, ...]  (positions 0,3,15 have high priority)
+          Row 1: [0, 2, 1, 3, 4, 5, ...]      (positions 0,2 have high priority, local!)
+          → Used for: req_to_token gather within each request's window
+
+        Args:
+            accept_index: [bs, num_steps+1], flat indices into [bs*tree_size] or -1
+            accept_length: [bs], number of accepted per request (on GPU)
+            tree_size: Number of tree positions per request
+
+        Returns:
+            per_req_perm: [bs, tree_size] - local permutation for each request
+        """
+        bs = accept_index.shape[0]
+        max_accept = accept_index.shape[1]
+        flat_size = bs * tree_size
+
+        # Priority: accepted get high priority (BASE - seq_id), rejected get 0
+        priorities = torch.zeros(flat_size, dtype=torch.int64, device=self.device)
+        BASE = flat_size + 1
+
+        # Build valid mask: which entries in accept_index are valid
+        col_ids = torch.arange(max_accept, device=self.device)
+        valid_mask = col_ids < accept_length.unsqueeze(1)
+
+        # Flatten and compute priorities
+        flat_accept = accept_index.flatten()
+        flat_valid = valid_mask.flatten()
+        flat_seq_ids = torch.arange(bs * max_accept, device=self.device)
+        flat_priorities = (BASE - flat_seq_ids) * flat_valid.long()
+
+        # Scatter priorities (clamp -1 to 0 for safety)
+        priorities.scatter_reduce_(
+            0,
+            flat_accept.clamp(min=0),
+            flat_priorities,
+            reduce="amax",
+            include_self=True,
+        )
+
+        # Per-row argsort for local permutation
+        priorities_2d = priorities.view(bs, tree_size)
+        return torch.argsort(priorities_2d, dim=1, descending=True, stable=True)
+
+    def _compact_req_to_token_with_perm(
+        self,
+        batch: ModelWorkerBatch,
+        per_req_perm: torch.Tensor,
+        tree_size: int,
+    ):
+        """
+        Apply pre-computed permutation to compact req_to_token verify window.
+
+        ═══════════════════════════════════════════════════════════════════════
+        SYNC-FREE: All operations are fixed-size, no data-dependent allocation.
+        ═══════════════════════════════════════════════════════════════════════
+
+        After compaction:
+          req_to_token[req, seq_len : seq_len + tree_size] has accepted slots
+          at the prefix positions [0..accept_len-1], rejected at suffix.
+
+        This makes tree mode's req_to_token look like chain mode's.
+
+        Args:
+            batch: Contains req_pool_indices, seq_lens
+            per_req_perm: [bs, tree_size] - local permutation indices
+            tree_size: Verify window size
+        """
+        bs = len(batch.seq_lens)
+        req_to_token = self.req_to_token_pool.req_to_token
+
+        # Build window indices: req_to_token[req_idx, seq_len : seq_len+tree_size]
+        req_rows = batch.req_pool_indices.unsqueeze(1).expand(bs, tree_size)
+        offsets = torch.arange(tree_size, device=self.device).unsqueeze(0)
+        window_cols = batch.seq_lens.unsqueeze(1) + offsets
+
+        # Read current slots, reorder by permutation, write back
+        old_slots = req_to_token[req_rows, window_cols]
+        new_slots = torch.gather(old_slots, 1, per_req_perm.long())
+        req_to_token.index_put_((req_rows, window_cols), new_slots)
 
     def move_accepted_tokens_to_target_kvcache(
         self,
